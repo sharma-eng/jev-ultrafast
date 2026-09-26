@@ -45,14 +45,22 @@ def command(name, body):
     global AGENT
     if name == "reset":
         scenario = body.get("scenario", "flights")
-        if scenario not in {"travel", "research", "flights"}:
+        if scenario not in {"travel", "research", "flights", "custom"}:
             raise ValueError("Unknown demo scenario")
+        url = body.get("url", "").strip()
+        if scenario == "custom":
+            if "://" not in url:
+                url = "https://" + url
+            if urlparse(url).scheme not in {"http", "https"} or not urlparse(url).netloc or len(url) > 2000:
+                raise ValueError("Enter a valid http(s) start URL")
         goal = body.get("goal", "").strip()
         if not goal or len(goal) > 2000:
             raise ValueError("Enter 1–2,000 characters")
         close_browser()
         AGENT = Agent(
-            "https://www.google.com/travel/flights?hl=en"
+            url
+            if scenario == "custom"
+            else "https://www.google.com/travel/flights?hl=en"
             if scenario == "flights"
             else f"{ORIGIN}/fixture.html?scenario={scenario}",
             goal,

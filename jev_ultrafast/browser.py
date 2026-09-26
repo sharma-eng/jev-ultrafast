@@ -2,11 +2,14 @@
 
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
-from browser_harness.admin import ensure_daemon
+from browser_harness.admin import ensure_daemon, restart_daemon
 from browser_harness.helpers import cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
@@ -17,10 +20,51 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def ensure_chrome():
+    """With BU_CDP_URL set, (re)launch the dedicated Chrome profile if its debug port is down."""
+    endpoint = os.environ.get("BU_CDP_URL")
+    if not endpoint or not Path(CHROME).exists():
+        return False
+
+    def up():
+        try:
+            urllib.request.urlopen(endpoint.rstrip("/") + "/json/version", timeout=1).read()
+            return True
+        except OSError:
+            return False
+
+    if up():
+        return False
+    port = endpoint.rsplit(":", 1)[-1].strip("/")
+    profile = Path(os.environ.get("JEV_CHROME_PROFILE", "~/.config/browser-harness/jev-chrome")).expanduser()
+    subprocess.Popen(
+        [CHROME, f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
+         "--no-first-run", "--no-default-browser-check", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    deadline = time.monotonic() + 15
+    while not up():
+        if time.monotonic() > deadline:
+            raise RuntimeError("Dedicated Chrome did not start; no action executed.")
+        time.sleep(0.2)
+    return True
+
+
 class Browser:
     def __init__(self, url):
+        if ensure_chrome():
+            restart_daemon()  # a daemon from the previous Chrome holds a dead connection
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        try:
+            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        except Exception:
+            # Chrome restarted under a live daemon: reconnect once and retry.
+            restart_daemon()
+            ensure_daemon()
+            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
@@ -85,8 +129,14 @@ class Browser:
                 time.sleep(0.02)
         raise StalePage("Page did not settle")
 
+    def same_page(self, page):
+        """Same document, URL, scroll, viewport and form values; ignores carousels and lazy content."""
+        return self.evaluate("(() => window.__jevFast?.pageKey() ?? null)()") == page["page_key"]
+
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        if action is not None and action["kind"] not in {"click", "select", "fill"}:
+            return self.same_page(page)
+        if action is not None:
             node = action["node"]
             if type(node) is not int:
                 return False
@@ -107,9 +157,12 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        target, self.target = self.target, None
+        if target:
+            try:
+                cdp("Target.closeTarget", targetId=target)
+            except Exception:
+                pass  # Tab or browser already gone; nothing left to close.
 
 
 def fingerprint(state):

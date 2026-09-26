@@ -186,6 +186,15 @@ def test_stale_decision_is_consumed_before_any_mutation(runner):
     assert runner.state["decision"] is None
 
 
+def test_done_survives_ambient_page_churn(runner):
+    # Carousels and lazy content change the full marker; the page itself is unchanged.
+    runner.state["browser"].fresh.return_value = False
+    runner.state["browser"].same_page.return_value = True
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+
+
 def test_generated_text_reused_only_for_identical_retry_context(runner, monkeypatch):
     helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
     monkeypatch.setattr(loop, "field_text", helper)
