@@ -12,11 +12,10 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
-def post_json(url, key, body, headers=None, timeout=25):
+def post_json(url, key, body):
     for attempt in range(3):
         try:
-            headers = {"Authorization": f"Bearer {key}", **(headers or {})}
-            response = CLIENT.post(url, json=body, headers=headers, timeout=timeout)
+            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -117,20 +116,13 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    if os.environ.get("JEV_URL"):
-        # Self-hosted Open-Jev speaks the same System One API; Modal proxy auth is optional.
-        modal_auth = {"Modal-Key": os.environ.get("MODAL_KEY", ""), "Modal-Secret": os.environ.get("MODAL_SECRET", "")}
-        url = os.environ["JEV_URL"].rstrip("/") + "/v1/systemone"
-        # Large candidate sets (e.g. date pickers) take longer on a self-hosted GPU.
-        timeout = float(os.environ.get("JEV_TIMEOUT", "120"))
-        result = post_json(url, "", body, modal_auth if modal_auth["Modal-Key"] else None, timeout)
-    elif os.environ.get("TYPESAFE_API_KEY"):
+    if os.environ.get("TYPESAFE_API_KEY"):
         result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
     else:
         # Jev 1.13 via OpenRouter's System One endpoint (same wire format as TypeSafe).
         key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TEXT_MODEL_API_KEY")
         if not key:
-            raise ValueError("Set OPENROUTER_API_KEY (or TYPESAFE_API_KEY / JEV_URL); no action executed.")
+            raise ValueError("Set OPENROUTER_API_KEY (or TYPESAFE_API_KEY); no action executed.")
         model = os.environ.get("OPENROUTER_JEV_MODEL", "typesafe/jev-1.13")
         result = post_json("https://openrouter.ai/api/v1/systemone", key, {**body, "model": model})
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
