@@ -13,6 +13,7 @@ import time
 
 import anyio
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .agent import Agent
 
@@ -95,7 +96,15 @@ async def browse_web(url: str, goal: str) -> dict:
 
 def main():
     port = int(os.environ.get("JEV_MCP_PORT", "8131"))
-    server.run("streamable-http", host="127.0.0.1", port=port, json_response=True, stateless_http=True)
+    # Extra Host headers to accept, e.g. a Tailscale serve name in front of this port.
+    # DNS-rebinding protection stays on; this only widens the localhost-only default.
+    extra = [h.strip() for h in os.environ.get("JEV_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
+    )
+    server.run("streamable-http", host="127.0.0.1", port=port, json_response=True, stateless_http=True,
+               transport_security=security)
 
 
 if __name__ == "__main__":
