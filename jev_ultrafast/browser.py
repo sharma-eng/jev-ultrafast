@@ -102,7 +102,7 @@ def stop_chrome():
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 2  # A frozen Chrome ignores SIGTERM; do not wait long for it.
     while time.monotonic() < deadline and any(main for _, _, main in chrome_processes()):
         time.sleep(0.2)
     for pid, _, _ in chrome_processes():

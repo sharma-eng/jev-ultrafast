@@ -28,7 +28,7 @@ BUDGET_SECONDS = float(os.environ.get("JEV_MCP_BUDGET", "15"))  # voice MCP call
 MAX_TASKS = max(1, int(os.environ.get("JEV_MCP_MAX_TASKS", "3")))  # parallel tabs
 QUEUE_SECONDS = 3.0  # how long a call waits for a free tab before saying so
 SLACK_SECONDS = 4.0  # past the budget, answer with partial results rather than wait
-MONITOR_SECONDS = float(os.environ.get("JEV_MCP_MONITOR_SECONDS", "20"))
+MONITOR_SECONDS = float(os.environ.get("JEV_MCP_MONITOR_SECONDS", "10"))
 RECYCLE_MB = int(os.environ.get("JEV_CHROME_RECYCLE_MB", "4000"))  # restart an idle Chrome above this
 LIMITS = (
     "Only read and navigate. Do not buy, pay, sign in, create accounts, or submit personal "
