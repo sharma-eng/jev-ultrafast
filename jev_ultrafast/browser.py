@@ -1,10 +1,17 @@
-"""Observed actions through Browser Harness; one CDP session, no per-step subprocess."""
+"""Observed actions through Browser Harness; one CDP session, no per-step subprocess.
+
+A web page can stall, pop a dialog, crash its renderer or take Chrome down with it. None of
+that may stop the service: every browser call is bounded, a stuck page fails only its own
+task, its tab is always closed, and the dedicated Chrome is relaunched when it stops answering.
+"""
 
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -15,72 +22,257 @@ from browser_harness.helpers import cdp
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+CALL_SECONDS = 5.0  # One CDP round trip; a page that takes longer is treated as stuck.
+NO_DIALOGS = "window.alert=()=>{};window.confirm=()=>false;window.prompt=()=>null;"
+
 
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class Unresponsive(RuntimeError):
+    """The page or browser stopped answering. Only this task fails; never retry its last input.
+
+    Deliberately not a TimeoutError, so no caller can mistake one stuck page for a hung service.
+    """
+
+
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# Studio runs headless: without these, macOS and Chrome throttle or freeze the hidden tabs
+# this agent drives, and Chrome's own hang dialog can block a page indefinitely.
+CHROME_FLAGS = (
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-startup-window",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-hang-monitor",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--disable-features=Translate,MediaRouter,OptimizationHints,HeavyAdIntervention,IntensiveWakeUpThrottling",
+)
+# Serialises (re)launching Chrome and the daemon with routine maintenance.
+MAINTENANCE = threading.RLock()
+# Tabs owned by running tasks. Every other page in the dedicated profile is a leftover.
+ACTIVE = set()
+ACTIVE_LOCK = threading.Lock()
+
+
+def profile_dir():
+    return Path(os.environ.get("JEV_CHROME_PROFILE", "~/.config/browser-harness/jev-chrome")).expanduser()
+
+
+def endpoint():
+    return os.environ.get("BU_CDP_URL", "").rstrip("/")
+
+
+def chrome_answers(timeout=1.0):
+    """True when the dedicated Chrome answers; False when nothing listens; None when it is stuck."""
+    try:
+        urllib.request.urlopen(endpoint() + "/json/version", timeout=timeout).read()
+        return True
+    except ConnectionRefusedError:
+        return False
+    except OSError as error:
+        reason = getattr(error, "reason", error)
+        return False if isinstance(reason, ConnectionRefusedError) else None
+
+
+def chrome_processes():
+    """(pid, rss_kb, is_main) for every process of the dedicated profile."""
+    marker = f"--user-data-dir={profile_dir()}"
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,rss=,command="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and marker in parts[2] and parts[1].isdigit():
+            found.append((int(parts[0]), int(parts[1]), "--type=" not in parts[2]))
+    return found
+
+
+def stop_chrome():
+    """Stop the dedicated Chrome (only that profile); it is relaunched on demand."""
+    mains = [pid for pid, _, main in chrome_processes() if main]
+    for pid in mains:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(main for _, _, main in chrome_processes()):
+        time.sleep(0.2)
+    for pid, _, _ in chrome_processes():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def launch_chrome():
+    port = endpoint().rsplit(":", 1)[-1]
+    subprocess.Popen(
+        [CHROME, f"--user-data-dir={profile_dir()}", f"--remote-debugging-port={port}", *CHROME_FLAGS],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    deadline = time.monotonic() + 20
+    while chrome_answers() is not True:
+        if time.monotonic() > deadline:
+            raise Unresponsive("Dedicated Chrome did not start; no action executed.")
+        time.sleep(0.2)
 
 
 def ensure_chrome():
-    """With BU_CDP_URL set, (re)launch the dedicated Chrome profile if its debug port is down."""
-    endpoint = os.environ.get("BU_CDP_URL")
-    if not endpoint or not Path(CHROME).exists():
+    """With BU_CDP_URL set, make sure the dedicated Chrome answers. Returns True if it was (re)started."""
+    if not endpoint() or not Path(CHROME).exists():
         return False
-
-    def up():
-        try:
-            urllib.request.urlopen(endpoint.rstrip("/") + "/json/version", timeout=1).read()
-            return True
-        except OSError:
+    with MAINTENANCE:
+        state = chrome_answers()
+        for _ in range(2):  # A busy Chrome can miss one probe; three misses in a row means stuck.
+            if state is not None:
+                break
+            time.sleep(0.5)
+            state = chrome_answers(timeout=2.0)
+        if state is True:
             return False
-
-    if up():
-        return False
-    port = endpoint.rsplit(":", 1)[-1].strip("/")
-    profile = Path(os.environ.get("JEV_CHROME_PROFILE", "~/.config/browser-harness/jev-chrome")).expanduser()
-    subprocess.Popen(
-        [CHROME, f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
-         "--no-first-run", "--no-default-browser-check", "about:blank"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    deadline = time.monotonic() + 15
-    while not up():
-        if time.monotonic() > deadline:
-            raise RuntimeError("Dedicated Chrome did not start; no action executed.")
-        time.sleep(0.2)
-    return True
+        if state is None or any(main for _, _, main in chrome_processes()):
+            stop_chrome()  # Listening but stuck, or alive without its debug port.
+        launch_chrome()
+        return True
 
 
-class Browser:
-    def __init__(self, url):
+def ready_browser():
+    """Chrome answering and a daemon connected to it, restarting whichever is broken."""
+    with MAINTENANCE:
         if ensure_chrome():
             restart_daemon()  # a daemon from the previous Chrome holds a dead connection
         ensure_daemon()
-        try:
-            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-        except Exception:
-            # Chrome restarted under a live daemon: reconnect once and retry.
-            restart_daemon()
-            ensure_daemon()
-            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-        self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
-        # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
-        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
-                break
-            time.sleep(0.02)
 
-    def call(self, method, **params):
-        return cdp(method, session_id=self.session, **params)
+
+def raw(method, timeout=CALL_SECONDS, **params):
+    """One browser-level CDP call that can only fail with Unresponsive or RuntimeError."""
+    try:
+        return cdp(method, _response_timeout=timeout, **params)
+    except TimeoutError:
+        raise Unresponsive(f"Browser did not answer {method}.") from None
+    except OSError:
+        raise Unresponsive("Browser connection is down.") from None
+
+
+def page_targets():
+    return [t for t in raw("Target.getTargets").get("targetInfos", []) if t.get("type") == "page"]
+
+
+def sweep_tabs(keep=()):
+    """Close pages no running task owns. Returns how many were closed."""
+    with ACTIVE_LOCK:
+        owned = set(ACTIVE) | set(keep)
+    closed = 0
+    for target in page_targets():
+        if target["targetId"] not in owned:
+            try:
+                raw("Target.closeTarget", targetId=target["targetId"])
+                closed += 1
+            except RuntimeError:
+                pass
+    return closed
+
+
+class Browser:
+    def __init__(self, url, deadline=None):
+        self.target = self.session = self.after_input = None
+        self.deadline = deadline or time.monotonic() + 30
+        ready_browser()
+        try:
+            self.target = raw("Target.createTarget", url="about:blank", background=True)["targetId"]
+        except RuntimeError:
+            # Chrome restarted under a live daemon: reconnect once and retry.
+            with MAINTENANCE:
+                restart_daemon()
+                ensure_daemon()
+            self.target = raw("Target.createTarget", url="about:blank", background=True)["targetId"]
+        with ACTIVE_LOCK:
+            ACTIVE.add(self.target)
+        try:
+            self.session = raw("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+            # Chrome tracks a page's alert/confirm dialogs only with Page enabled; rescue() needs that.
+            self.call("Page.enable")
+            # Tasks are read-only, so a page's dialogs only ever block it: answer them as "cancel"
+            # before the page's own scripts run. rescue() still covers anything this misses.
+            self.call("Page.addScriptToEvaluateOnNewDocument", source=NO_DIALOGS)
+            self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+            # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
+            self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            try:
+                self.call("Page.navigate", url=url, timeout=min(10.0, self.remaining()))
+            except Unresponsive:
+                pass  # A slow server: keep waiting for the document below, within the task's budget.
+            deadline = min(time.monotonic() + 15, self.deadline)
+            while time.monotonic() < deadline:
+                try:
+                    loaded = self.evaluate("document.readyState === 'complete' && location.href !== 'about:blank'")
+                except (StalePage, Unresponsive):
+                    loaded = False
+                if loaded:
+                    break
+                time.sleep(0.05)
+        except BaseException:
+            self.close()  # Never leave a tab behind, whatever failed.
+            raise
+
+    def remaining(self):
+        return max(1.0, self.deadline - time.monotonic())
+
+    def call(self, method, timeout=CALL_SECONDS, **params):
+        try:
+            return cdp(method, session_id=self.session, _response_timeout=min(timeout, self.remaining()), **params)
+        except TimeoutError:
+            raise Unresponsive(f"The page stopped responding ({method}).") from None
+        except OSError:
+            raise Unresponsive("Browser connection is down.") from None
+
+    def rescue(self):
+        """Dismiss a JavaScript dialog if one is what blocks the page. True if one was open.
+
+        Chrome answers this from the browser process, so it is quick even while the page is busy.
+        """
+        try:
+            self.call("Page.handleJavaScriptDialog", timeout=2.0, accept=False)
+            return True
+        except RuntimeError:
+            return False
+
+    def busy_wait_left(self):
+        """Seconds a read may still wait for a busy page before the task gives up."""
+        return self.deadline - time.monotonic() - 0.5
+
+    def salvage(self):
+        """Whatever the tab shows right now, for a partial answer. Never raises."""
+        if not self.session:
+            return {}
+        try:
+            value = self.call(
+                "Runtime.evaluate", timeout=2.0, returnByValue=True,
+                expression="({url: location.href, title: document.title, text: document.body?.innerText ?? ''})",
+            ).get("result", {}).get("value")
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
 
     def evaluate(self, expression):
-        response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+        try:
+            response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+        except Unresponsive:
+            # A read is safe to repeat. Clear a dialog if that is what blocked it; otherwise the
+            # page is busy (heavy sites block for seconds while loading), so observe again.
+            if self.rescue():
+                raise StalePage("A page dialog was dismissed. Observe again.") from None
+            if self.busy_wait_left() > 0:
+                raise StalePage("The page is busy. Observe again.") from None
+            raise
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
@@ -113,21 +305,28 @@ class Browser:
                       };
                       requestAnimationFrame(ready);
                     }))(""" + json.dumps(action) + ")",
+                    timeout=2.0,
                     awaitPromise=True,
                     returnByValue=True,
                 )
             except RuntimeError:
-                pass
-        for attempt in range(10):
+                pass  # Includes Unresponsive: the settle wait is best-effort and read-only.
+        stale = 0
+        while True:
             try:
                 return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
+                    {"operation": "observe", "session": self.session, "screenshot": screenshot,
+                     "timeout": min(CALL_SECONDS, self.remaining())}
                 )
             except StalePage:
-                if attempt == 9:
+                stale += 1
+                if stale == 10:
                     raise
                 time.sleep(0.02)
-        raise StalePage("Page did not settle")
+            except Unresponsive:
+                # Reading is safe to repeat: wait out a busy page for as long as the task allows.
+                if not self.rescue() and self.busy_wait_left() <= 0:
+                    raise
 
     def same_page(self, page):
         """Same document, URL, scroll, viewport and form values; ignores carousels and lazy content."""
@@ -152,7 +351,9 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        # A timeout here raises Unresponsive, which stops the task: the input may have landed.
+        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text,
+                                    "timeout": min(CALL_SECONDS, self.remaining())})
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -160,9 +361,13 @@ class Browser:
         target, self.target = self.target, None
         if target:
             try:
-                cdp("Target.closeTarget", targetId=target)
+                # Browser-level, so it works even when the page's renderer is stuck.
+                raw("Target.closeTarget", timeout=3.0, targetId=target)
             except Exception:
-                pass  # Tab or browser already gone; nothing left to close.
+                pass  # Tab or browser already gone; the sweep removes anything left.
+            finally:
+                with ACTIVE_LOCK:
+                    ACTIVE.discard(target)
 
 
 def fingerprint(state):
@@ -173,9 +378,15 @@ def fingerprint(state):
 def browser_operation(request):
     operation = request["operation"]
     session = request["session"]
+    timeout = request.get("timeout", CALL_SECONDS)
 
     def call(method, **params):
-        return cdp(method, session_id=session, **params)
+        try:
+            return cdp(method, session_id=session, _response_timeout=timeout, **params)
+        except TimeoutError:
+            raise Unresponsive(f"The page stopped responding ({method}).") from None
+        except OSError:
+            raise Unresponsive("Browser connection is down.") from None
 
     def evaluate(expression):
         result = call("Runtime.evaluate", expression=expression, returnByValue=True)
