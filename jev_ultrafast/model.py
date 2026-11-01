@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import threading
 import time
 
 import httpx
@@ -10,15 +11,25 @@ import httpx
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+# A caller (one task, one thread) may set LIMIT.deadline (time.monotonic) so no model call outlives it.
+LIMIT = threading.local()
+
+
+def remaining():
+    deadline = getattr(LIMIT, "deadline", None)
+    return 25.0 if deadline is None else deadline - time.monotonic()
 
 
 def post_json(url, key, body):
     for attempt in range(3):
+        left = remaining()
+        if left < 0.5:
+            raise RuntimeError("Out of time before the model answered; no action executed.")
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=min(25.0, left))
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
-        if response.status_code in {429, 529, 503} and attempt < 2:
+        if response.status_code in {429, 529, 503} and attempt < 2 and remaining() > 2:
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
@@ -116,7 +127,15 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    if os.environ.get("TYPESAFE_API_KEY"):
+        result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    else:
+        # Jev 1.13 via OpenRouter's System One endpoint (same wire format as TypeSafe).
+        key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TEXT_MODEL_API_KEY")
+        if not key:
+            raise ValueError("Set OPENROUTER_API_KEY (or TYPESAFE_API_KEY); no action executed.")
+        model = os.environ.get("OPENROUTER_JEV_MODEL", "typesafe/jev-1.13")
+        result = post_json("https://openrouter.ai/api/v1/systemone", key, {**body, "model": model})
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -158,6 +177,16 @@ def field_context(goal, action, page, history):
 
 
 def field_text(context):
+    # Small text models occasionally return malformed JSON; one retry keeps a run alive.
+    try:
+        return _field_text(context)
+    except ValueError as error:
+        if "TEXT_MODEL_API_KEY" in str(error):
+            raise
+        return _field_text(context)
+
+
+def _field_text(context):
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
